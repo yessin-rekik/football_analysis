@@ -1,7 +1,7 @@
 import pytest
 
-from football_analysis.config import PitchConfig
-from football_analysis.schemas import (
+from config import PitchConfig
+from schemas import (
     CalibrationStatus, ObjectClass, Team, PositionProvenance,
     PixelPoint, WorldPoint, CalibrationInfo, TrackedObject, FrameResult,
     MatchMetadata,

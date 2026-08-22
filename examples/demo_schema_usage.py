@@ -10,8 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from football_analysis.config import PitchConfig
-from football_analysis.schemas import (
+from config import PitchConfig
+from schemas import (
     CalibrationStatus, ObjectClass, Team, PositionProvenance,
     PixelPoint, WorldPoint, CalibrationInfo, TrackedObject, FrameResult,
     ModelVersions, MatchMetadata,
