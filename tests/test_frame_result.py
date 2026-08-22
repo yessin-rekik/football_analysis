@@ -1,7 +1,7 @@
 import pytest
 
-from config import PitchConfig
-from schemas import (
+from ..config import PitchConfig
+from ..schemas import (
     CalibrationStatus, ObjectClass, Team, PositionProvenance,
     PixelPoint, WorldPoint, CalibrationInfo, TrackedObject, FrameResult,
     MatchMetadata,

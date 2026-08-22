@@ -1,6 +1,6 @@
 import pytest
 
-from config import PitchConfig, PitchKeypointName
+from ..config import PitchConfig, PitchKeypointName
 
 
 def test_default_dimensions():
