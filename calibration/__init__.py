@@ -1,4 +1,3 @@
-# Phase 1 -- calibration layer (scene routing, keypoint model, homography, camera motion propagation)
 # Phase 1a -- scene routing (SceneType, classifiers, model registry) and
 # keypoint-based homography calibration.
 # Phase 1b (camera-motion propagation for zoom/occlusion gaps) will extend
@@ -9,6 +8,7 @@ from .scene_classifier import BaseSceneClassifier, HeuristicSceneClassifier, Sce
 from .keypoint_model import BaseKeypointModel, YoloKeypointModel
 from .model_registry import KeypointModelRegistry, ModelNotAvailableError
 from .calibrator import PitchCalibrator
+from .pipeline import CalibrationPipeline, CalibrationPipelineResult
 
 __all__ = [
     "SceneType",
@@ -20,4 +20,6 @@ __all__ = [
     "KeypointModelRegistry",
     "ModelNotAvailableError",
     "PitchCalibrator",
+    "CalibrationPipeline",
+    "CalibrationPipelineResult",
 ]
