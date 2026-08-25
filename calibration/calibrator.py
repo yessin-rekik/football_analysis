@@ -31,6 +31,10 @@ class PitchCalibrator:
         min_points: int = 4,
         confidence_threshold: float = 0.5,
         ransac_reproj_threshold: float = 5.0,
+        use_confidence_weighting: bool = False,
+        confidence_weight_max_multiplier: int = 3,
+        max_mean_reprojection_error: Optional[float] = None,
+        max_max_reprojection_error: Optional[float] = None,
     ):
         self.pitch_config = pitch_config
         self.world_keypoints = pitch_config.world_keypoints()  # (29, 2), meters
@@ -38,11 +42,41 @@ class PitchCalibrator:
         self.confidence_threshold = confidence_threshold
         self.ransac_reproj_threshold = ransac_reproj_threshold
 
+        # Confidence weighting: OpenCV's findHomography has no native
+        # per-point weight parameter. The standard workaround is to
+        # duplicate higher-confidence points in the fitting set so the
+        # least-squares refinement leans toward them -- opt-in since it's
+        # a heuristic, not exact weighted least squares.
+        self.use_confidence_weighting = use_confidence_weighting
+        self.confidence_weight_max_multiplier = confidence_weight_max_multiplier
+
+        # Reprojection-error rejection: None (default) preserves the
+        # original behavior of reporting error as a diagnostic only. Set
+        # either to turn a bad-but-technically-successful homography into
+        # an explicit NOT_CALIBRATED rather than silently trusting it.
+        self.max_mean_reprojection_error = max_mean_reprojection_error
+        self.max_max_reprojection_error = max_max_reprojection_error
+
         # Cached only so pixel_to_world()/project_pitch_outline() can be
         # called right after calibrate_frame() without re-passing the
         # matrix -- reset to None on every failed calibration, never
         # carried forward as a stale guess (see module docstring).
         self._homography: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _weighted_points(
+        src_pts: np.ndarray, dst_pts: np.ndarray, confidences: np.ndarray, max_multiplier: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Duplicates each correspondence proportionally to its confidence
+        (1x at confidence 0, max_multiplier x at confidence 1), so
+        findHomography's internal least-squares refinement is biased
+        toward higher-confidence points without needing a weighted solver."""
+        src_out, dst_out = [], []
+        for s, d, w in zip(src_pts, dst_pts, confidences):
+            count = 1 + int(round(float(w) * (max_multiplier - 1)))
+            src_out.extend([s] * count)
+            dst_out.extend([d] * count)
+        return np.array(src_out, dtype=np.float32), np.array(dst_out, dtype=np.float32)
 
     def calibrate_frame(self, keypoints_px: np.ndarray, confidences: np.ndarray) -> CalibrationInfo:
         """
@@ -63,8 +97,16 @@ class PitchCalibrator:
 
         src_pts = keypoints_px[visible_indices].astype(np.float32)
         dst_pts = self.world_keypoints[visible_indices].astype(np.float32)
+        point_confidences = confidences[visible_indices]
 
-        H, _mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_reproj_threshold)
+        if self.use_confidence_weighting:
+            fit_src, fit_dst = self._weighted_points(
+                src_pts, dst_pts, point_confidences, self.confidence_weight_max_multiplier
+            )
+        else:
+            fit_src, fit_dst = src_pts, dst_pts
+
+        H, _mask = cv2.findHomography(fit_src, fit_dst, cv2.RANSAC, self.ransac_reproj_threshold)
         if H is None:
             return CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED)
 
@@ -73,16 +115,27 @@ class PitchCalibrator:
         except np.linalg.LinAlgError:
             return CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED)
 
+        # Diagnostic is always measured against the ORIGINAL (undupli-
+        # cated) points, never the weighted fitting set -- otherwise
+        # confidence weighting could make a genuinely bad calibration
+        # look artificially good on its own error metric.
         reprojected = cv2.perspectiveTransform(dst_pts.reshape(-1, 1, 2), H_inv).reshape(-1, 2)
         errors = np.linalg.norm(reprojected - src_pts, axis=1)
+        mean_err = float(errors.mean())
+        max_err = float(errors.max())
+
+        if self.max_mean_reprojection_error is not None and mean_err > self.max_mean_reprojection_error:
+            return CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED)
+        if self.max_max_reprojection_error is not None and max_err > self.max_max_reprojection_error:
+            return CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED)
 
         self._homography = H
 
         return CalibrationInfo(
             status=CalibrationStatus.CALIBRATED_FROM_KEYPOINTS,
             homography=H.tolist(),
-            reprojection_error_px_mean=float(errors.mean()),
-            reprojection_error_px_max=float(errors.max()),
+            reprojection_error_px_mean=mean_err,
+            reprojection_error_px_max=max_err,
             num_keypoints_used=int(len(visible_indices)),
             frames_since_last_anchor=0,
         )
