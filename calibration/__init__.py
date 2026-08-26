@@ -8,7 +8,10 @@ from .scene_classifier import BaseSceneClassifier, HeuristicSceneClassifier, Sce
 from .keypoint_model import BaseKeypointModel, YoloKeypointModel
 from .model_registry import KeypointModelRegistry, ModelNotAvailableError
 from .calibrator import PitchCalibrator
+from .smoothed_calibrator import SmoothedPitchCalibrator
 from .pipeline import CalibrationPipeline, CalibrationPipelineResult
+from .camera_motion_tracker import BaseMotionTracker, CameraMotionTracker
+from .propagating_calibrator import PropagatingCalibrator
 
 __all__ = [
     "SceneType",
@@ -20,6 +23,10 @@ __all__ = [
     "KeypointModelRegistry",
     "ModelNotAvailableError",
     "PitchCalibrator",
+    "SmoothedPitchCalibrator",
     "CalibrationPipeline",
     "CalibrationPipelineResult",
+    "BaseMotionTracker",
+    "CameraMotionTracker",
+    "PropagatingCalibrator",
 ]

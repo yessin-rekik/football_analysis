@@ -79,6 +79,17 @@ class PropagatingCalibrator:
 
         keypoint_result = None
         if keypoints_px is not None and keypoint_confidences is not None:
+            if self._status != CalibrationStatus.CALIBRATED_FROM_KEYPOINTS:
+                # We were PROPAGATED or never anchored -- if the injected
+                # calibrator does its own frame-to-frame smoothing (e.g.
+                # SmoothedPitchCalibrator), reset it BEFORE this attempt.
+                # Resetting only after success would be too late: the
+                # fresh estimate would already have been blended with a
+                # stale pre-gap value by then. Plain PitchCalibrator has
+                # no reset() method, so this is a no-op for it.
+                reset_fn = getattr(self.pitch_calibrator, "reset", None)
+                if callable(reset_fn):
+                    reset_fn()
             keypoint_result = self.pitch_calibrator.calibrate_frame(keypoints_px, keypoint_confidences)
 
         if keypoint_result is not None and keypoint_result.status == CalibrationStatus.CALIBRATED_FROM_KEYPOINTS:
