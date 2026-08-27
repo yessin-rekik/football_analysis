@@ -13,7 +13,7 @@ markings are in frame at all.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -53,7 +53,17 @@ class CalibrationPipeline:
         self.calibrator = calibrator or PitchCalibrator(pitch_config, confidence_threshold=confidence_threshold)
         self.confidence_threshold = confidence_threshold
 
-    def process_frame(self, frame: np.ndarray) -> CalibrationPipelineResult:
+    def route_and_detect(self, frame: np.ndarray) -> Tuple[SceneClassification, np.ndarray, np.ndarray]:
+        """
+        Runs scene classification + model routing/detection ONLY -- no
+        calibration. Always returns whatever keypoints/confidences the
+        selected model(s) actually produced, even for CLOSE_UP frames
+        (never converts to None itself). A caller that needs the Phase 1b
+        "None means skip calibration entirely" convention for CLOSE_UP
+        frames applies that translation itself (see
+        VideoCalibrationOrchestrator) -- that's a PropagatingCalibrator
+        contract, not something routing needs to know about.
+        """
         # Step 1: always start with the broadcast model -- it's the one
         # guaranteed to be registered, and its output is what the
         # classifier needs to make a routing decision at all.
@@ -64,17 +74,6 @@ class CalibrationPipeline:
             frame, keypoints_px, confidences, self.confidence_threshold
         )
 
-        if scene_result.scene_type == SceneType.CLOSE_UP:
-            # No pitch markings in view, regardless of which model runs.
-            # Don't waste a second inference call -- this frame is a
-            # Phase 1b (camera-motion propagation) case, not a routing case.
-            return CalibrationPipelineResult(
-                scene_classification=scene_result,
-                calibration_info=CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED),
-                keypoints_px=keypoints_px,
-                keypoint_confidences=confidences,
-            )
-
         if scene_result.scene_type == SceneType.LOW_ANGLE_CORNER:
             low_angle_model = self.registry.get_model(SceneType.LOW_ANGLE_CORNER)
             # If no low-angle model is registered yet, get_model() already
@@ -83,6 +82,22 @@ class CalibrationPipeline:
             # inference call on identical input.
             if low_angle_model is not initial_model:
                 keypoints_px, confidences = low_angle_model.predict(frame)
+
+        return scene_result, keypoints_px, confidences
+
+    def process_frame(self, frame: np.ndarray) -> CalibrationPipelineResult:
+        scene_result, keypoints_px, confidences = self.route_and_detect(frame)
+
+        if scene_result.scene_type == SceneType.CLOSE_UP:
+            # No pitch markings in view, regardless of which model runs.
+            # This frame is a Phase 1b (camera-motion propagation) case,
+            # not a calibration-from-keypoints case.
+            return CalibrationPipelineResult(
+                scene_classification=scene_result,
+                calibration_info=CalibrationInfo(status=CalibrationStatus.NOT_CALIBRATED),
+                keypoints_px=keypoints_px,
+                keypoint_confidences=confidences,
+            )
 
         calibration_info = self.calibrator.calibrate_frame(keypoints_px, confidences)
 

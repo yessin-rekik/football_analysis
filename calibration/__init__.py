@@ -12,6 +12,7 @@ from .smoothed_calibrator import SmoothedPitchCalibrator
 from .pipeline import CalibrationPipeline, CalibrationPipelineResult
 from .camera_motion_tracker import BaseMotionTracker, CameraMotionTracker
 from .propagating_calibrator import PropagatingCalibrator
+from .orchestrator import VideoCalibrationOrchestrator, OrchestratedFrameResult
 
 __all__ = [
     "SceneType",
@@ -29,4 +30,6 @@ __all__ = [
     "BaseMotionTracker",
     "CameraMotionTracker",
     "PropagatingCalibrator",
+    "VideoCalibrationOrchestrator",
+    "OrchestratedFrameResult",
 ]
