@@ -1,3 +1,15 @@
+# Core -- needed to import/run any part of this package, including the
+# test suite (config schema, canonical output schema, homography math).
 pydantic>=2
 numpy
+opencv-python
+
+# Model inference -- only needed by calibration/keypoint_model.py's
+# YoloKeypointModel. Imported lazily there specifically so the rest of
+# the package (routing, calibration math, the test suite) works without
+# this installed -- e.g. in a CI environment with no GPU. Required for
+# any real video/model usage (the distance_tool, a future video runner).
+ultralytics
+
+# Dev/testing only.
 pytest
