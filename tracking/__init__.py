@@ -8,4 +8,6 @@ __all__ = [
     "Detection",
     "BaseObjectDetector",
     "YoloObjectDetector",
+    "BaseTracker",
+    "ByteTracker"
 ]
