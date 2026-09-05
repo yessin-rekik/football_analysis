@@ -9,5 +9,8 @@ __all__ = [
     "BaseObjectDetector",
     "YoloObjectDetector",
     "BaseTracker",
-    "ByteTracker"
+    "ByteTracker",
+    "BaseTeamClassifier",
+    "JerseyColorTeamClassifier",
+    
 ]
