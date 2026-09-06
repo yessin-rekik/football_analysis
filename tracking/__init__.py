@@ -3,6 +3,9 @@
 
 from .detection import Detection
 from .detector import BaseObjectDetector, YoloObjectDetector
+from .tracker import BaseTracker, ByteTracker
+from .team_classifier import BaseTeamClassifier, JerseyColorTeamClassifier
+from .reid import BaseReIdentifier, ReIdentifier
 
 __all__ = [
     "Detection",
@@ -12,5 +15,6 @@ __all__ = [
     "ByteTracker",
     "BaseTeamClassifier",
     "JerseyColorTeamClassifier",
-    
+    "BaseReIdentifier",
+    "ReIdentifier",
 ]

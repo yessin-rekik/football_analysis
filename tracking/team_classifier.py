@@ -41,10 +41,20 @@ Design summary (confirmed in planning):
     excluded from both fitting and assignment for that frame -- team stays
     whatever it already was (None by default) rather than being set from
     noise.
+  - Per-track color history (Phase 2 re-ID support): every successful
+    color extraction (a `TrackedObject` that gets a team assigned) is
+    also appended to that track's bounded deque of recent colors. The
+    re-identification module (Phase 2 remainder, `tracking/reid.py`)
+    reads from this cache via `get_color_history(track_id)` to recognise
+    a returning player after a tracking gap. The deque is bounded by
+    `max_color_history_per_track` (default 8 frames; 0.27s at 30fps --
+    generous, enough to survive one bad frame like an all-green sliver
+    without losing the signal).
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -84,6 +94,7 @@ class JerseyColorTeamClassifier(BaseTeamClassifier):
         self,
         ema_alpha: float = 0.1,
         min_players_for_fit: int = 4,
+        max_color_history_per_track: int = 8,
     ):
         """
         ema_alpha: how much each frame's freshly-fit centroids move the
@@ -95,9 +106,14 @@ class JerseyColorTeamClassifier(BaseTeamClassifier):
             all. Below this, the frame skips fitting and falls back to
             assigning against whatever running centroids already exist (or
             leaves everyone unassigned if none exist yet).
+        max_color_history_per_track: per-track deque length for the
+            re-identification read path. Capped to bound memory -- 8
+            frames at 30fps is 0.27s of color history, generous enough to
+            survive one bad frame without losing the signal.
         """
         self.ema_alpha = ema_alpha
         self.min_players_for_fit = min_players_for_fit
+        self.max_color_history_per_track = max_color_history_per_track
 
         # (2, 3) running BGR centroids, or None until the first successful
         # fit. Index identity (which row means "team A") is fixed at first
@@ -105,6 +121,30 @@ class JerseyColorTeamClassifier(BaseTeamClassifier):
         # inherent mapping from cluster index to Team.HOME/AWAY, it's just
         # whichever mapping the first fit happened to produce.
         self._running_centroids: Optional[np.ndarray] = None
+
+        # track_id -> bounded deque of BGR float64 colors, most-recent at
+        # the right end. Populated lazily: a track is added the first
+        # time its color is successfully extracted. Bounded by
+        # max_color_history_per_track via deque(maxlen=...) so the cache
+        # can't grow without limit. Consulted by the re-identification
+        # module via `get_color_history(track_id)`.
+        self._color_history: Dict[int, Deque[np.ndarray]] = {}
+
+    def get_color_history(self, track_id: int) -> Optional[Deque[np.ndarray]]:
+        """Public read-only view of a single track's recent jersey-color
+        history (most-recent-last), or None if no color has ever been
+        successfully extracted for this track.
+
+        The returned deque is the classifier's own internal cache, NOT a
+        copy -- callers MUST NOT mutate it. This is documented as a
+        window onto the cache, not an export.
+
+        Consumed by `tracking/reid.py` to recognise a returning player
+        after a tracking gap. Re-ID needs to see the most recent color
+        seen for a dropped track to gate the new track's color against
+        it; the cache keeps the most recent N frames' worth of colors.
+        """
+        return self._color_history.get(track_id)
 
     # ---- jersey color extraction ----
 
@@ -195,15 +235,48 @@ class JerseyColorTeamClassifier(BaseTeamClassifier):
 
         if self._running_centroids is None:
             # Never successfully fit yet (not enough players, e.g. very
-            # start of a clip) -- nothing to assign against.
-            return tracked_objects
+            # start of a clip) -- nothing to assign against. The per-track
+            # color-history cache (re-ID support) is still populated below
+            # regardless, because re-ID needs a color log per track even
+            # before team centroids exist: the very first respawn of a
+            # single-player scene can otherwise have no color signal to
+            # match against. See `tests/test_reid.py`'s tests for the
+            # concrete failure mode this guards against.
+            pass
+        else:
+            for obj in tracked_objects:
+                if obj.object_class not in TEAM_ELIGIBLE_CLASSES:
+                    continue
+                color = self._jersey_color(frame, obj)
+                if color is None:
+                    continue  # no guessing -- leave team as-is (None by default)
+                obj.team = self._nearest_team(color)
 
+        # Per-track color history for the re-identification module.
+        # Populated on EVERY successful color extraction for a
+        # TEAM_ELIGIBLE_CLASSES object -- independent of whether the
+        # team centroids have been fit yet. Bounded by
+        # max_color_history_per_track via deque(maxlen=...) so memory is
+        # capped. The deque is most-recent-at-the-right; re-ID reads
+        # cached[-1] for the most recent color.
+        #
+        # TODO (v2, perf): the assignment loop above and this loop both
+        # call `_jersey_color` on the same objects when centroids
+        # exist. For 22 players at 25fps that's ~550 extra
+        # cv2.cvtColor+median calls per second of video. The clean
+        # refactor is to compute each player's color once into a local
+        # dict and reuse it in both loops. Not blocking -- the cost is
+        # sub-millisecond per player and well within real-time budget
+        # at broadcast frame rates -- but worth doing before the
+        # pipeline gets pushed above 30fps or player counts grow.
         for obj in tracked_objects:
             if obj.object_class not in TEAM_ELIGIBLE_CLASSES:
                 continue
             color = self._jersey_color(frame, obj)
             if color is None:
-                continue  # no guessing -- leave team as-is (None by default)
-            obj.team = self._nearest_team(color)
+                continue
+            self._color_history.setdefault(
+                obj.track_id, deque(maxlen=self.max_color_history_per_track)
+            ).append(color)
 
         return tracked_objects

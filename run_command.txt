@@ -1,0 +1,1 @@
+python -m football_analysis.tools.run_pipeline --video football_analysis/clips/test_segment.mp4 --keypoint-model football_analysis/weights/keypoint_broadcast.pt --detector-model football_analysis/weights/detector_player_ball.pt --class-id-map 0:player,1:ball,2:goalkeeper,3:referee --output-dir football_analysis/outputs/test_run_01
