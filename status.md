@@ -263,11 +263,10 @@ Resolved with a non-invasive seam rather than merging the two classes:
   re-supplying the complete updated `detection.py`. This is what motivated
   the "always re-show the full file on any edit" rule below, and the
   even stricter one-file-per-prompt rule.
-**Phase 2 is functionally complete.** The only item from the original plan
-not yet built is re-identification after long tracking gaps (see "Not
-started yet" below) -- everything needed to produce a fully-populated
-`TrackedObject` (identity, class, team) for a normally-tracked frame exists
-and is tested.
+**Phase 2 is functionally complete.** Re-identification after long tracking
+gaps (`tracking/reid.py`) is implemented and integrated -- everything needed
+to produce a fully-populated `TrackedObject` (identity, class, team) for a
+normally-tracked frame exists and is tested.
  
 ## Not started yet
  

@@ -1,77 +1,102 @@
-# football_analysis -- Phase 0
+# football_analysis
 
-Foundations for the football tracking/tactical analysis project: the config
-schema and the canonical output schema that every later phase (calibration,
-tracking, coordinates, stats, API) will read and write. See the project
-plan markdown for full phase-by-phase context; this package implements
-Phase 0 specifically.
+A football broadcast video → per-frame tactical analysis pipeline. The project processes camera footage to detect players, track them across frames, and convert pixel coordinates to real-world meters using pitch geometry calibration.
 
-## Layout
+## What it does
+
+1. **Scene detection** - Identifies whether the camera is in BROADCAST_WIDE, LOW_ANGLE_CORNER, CLOSE_UP, or UNKNOWN mode
+2. **Keypoint calibration** - Detects 29 keypoint positions on the pitch and computes a homography transform
+3. **Camera motion tracking** - Propagates calibration across frames to handle zoom/occlusion gaps
+4. **Object detection** - Detects players and the ball in each frame
+5. **Tracking** - Maintains stable IDs for tracked objects across frames
+6. **Team classification** - Assigns teams based on jersey color (green mask + EMA smoothing)
+
+## Project layout
 
 ```
 football_analysis/
-  config/
-    pitch_config.py      PitchConfig -- pitch dimensions (meters), FIFA
-                          defaults, validated, with a world_keypoints()
-                          method producing the (29,2) meter-coordinate
-                          array for the standard keypoint schema.
-  schemas/
-    enums.py              CalibrationStatus, ObjectClass, Team, PositionProvenance
-    frame_result.py        FrameResult, TrackedObject, CalibrationInfo,
-                          PixelPoint, WorldPoint, BoundingBox -- the
-                          canonical per-frame output contract
-    match_metadata.py     MatchMetadata, ModelVersions -- match-level context
-  calibration/            Phase 1 (empty stub)
-  tracking/                Phase 2 (empty stub)
-  coordinates/             Phase 3 (empty stub)
-  api/                     Phase 5 (empty stub)
-  examples/
-    demo_schema_usage.py   End-to-end usage demo, run this first
-  tests/                   pytest suite locking the schema contract
+  config/pitch_config.py          Pitch dimensions (FIFA-standard), validated via pydantic
+  schemas/                        Output contract: FrameResult, TrackedObject, CalibrationInfo
+  calibration/                    Scene routing, keypoint detection, homography computation
+    orchestrator.py                Main entry point for video processing
+  tracking/                       Object detection, ByteTracker, jersey-based team assignment
+    __init__.py                    Exports detector, tracker, classifier
+  coordinates/                    (Phase 3 - coordinate transforms)
+  api/                            (Phase 5 - FastAPI microservice)
+  tools/distance_tool.py          Interactive tool: click two points to measure real distance
+  examples/demo_schema_usage.py   Example showing schema usage
+  tests/                          pytest suite
 ```
 
-## Why this shape
+## Technologies
 
-- **`PitchConfig` flows into everything.** It's created once (from API
-  input in Phase 5, or FIFA-standard defaults elsewhere) and passed down
-  rather than any stage hardcoding 105x68 or box dimensions. Its
-  `world_keypoints()` method is now the *only* place pitch geometry is
-  turned into keypoint coordinates -- Phase 1's calibrator will call this
-  instead of recomputing geometry itself.
-- **`FrameResult` is the contract, not an implementation detail.** Stats
-  code (Phase 4, not built yet) should never need to import anything from
-  `calibration/` or `tracking/` -- it reads `FrameResult` objects only.
-  This is what makes "modular and scalable" concrete: any future consumer
-  (a new stat, a different frontend, a different sport even) just needs to
-  produce or consume this schema.
-- **Provenance is tracked at the field level, not bolted on later.**
-  `CalibrationInfo.status` (not_calibrated / calibrated_from_keypoints /
-  propagated / re_anchored) and `TrackedObject.provenance` (observed /
-  interpolated / re_identified_after_gap) exist because retrofitting "which
-  numbers can I actually trust" after Phases 1-2 are built is much harder
-  than designing for it from the start -- directly motivated by the
-  low-angle-model and zoom/occlusion-gap discussions from planning.
-- **Everything is a pydantic model.** Free validation (e.g. `PitchConfig`
-  rejects a penalty area wider than the pitch), free JSON
-  serialization/deserialization (round-trip tested), and this drops
-  straight into FastAPI request/response models in Phase 5 with no rework.
+- **Python** - main language
+- **Pydantic** - data validation and JSON serialization for all schemas
+- **OpenCV (cv2)** - homography, optical flow, color segmentation, k-means clustering
+- **Ultralytics YOLO** - keypoint detection and object detection (lazy-loaded)
+- **NumPy** - numerical operations
 
-## Running things
+## Running the project
+
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
+```
 
-# see the schema in action
+### Run the demo
+
+Shows how schemas work together:
+
+```bash
 python examples/demo_schema_usage.py
+```
 
-# run the test suite
+### Run tests
+
+```bash
 pytest tests/ -v
 ```
 
-## Next: Phase 1a/1b
+## Main entry point
 
-Calibration layer -- scene routing for low camera angles, keypoint-based
-homography (porting/replacing the existing `PitchCalibrator` prototype to
-consume `PitchConfig` instead of hardcoded constants), and camera-motion
-propagation for the zoom/occlusion gap problem, emitting `CalibrationInfo`
-per frame.
+Process video frames through the full pipeline:
+
+```python
+from calibration.orchestrator import VideoCalibrationOrchestrator
+
+# Create orchestrator (uses FIFA defaults, or custom PitchConfig)
+orchestrator = VideoCalibrationOrchestrator()
+
+# Process a frame and get calibrated world positions + tracked objects
+result = orchestrator.process_frame(frame)
+```
+
+`result` contains:
+- `calibration`: homography for pixel→world conversion, calibration status
+- `tracked_objects`: list of TrackedObject with position (meters), team assignment, provenance
+
+## Output schema
+
+All phases emit pydantic models that fit together:
+
+- **FrameResult** - per-frame output combining calibration info + tracked objects
+- **TrackedObject** - player/ball with world position, track ID, team, provenance
+- **CalibrationInfo** - homography, status (calibrated/propagated/not_calibrated)
+
+## Conventions
+
+- Schemas in `schemas/` are the only thing downstream code imports from
+- Every class implements a duck-typed interface (e.g., `BaseTracker`)
+- Provenance is tracked separately for calibration trust and object identity
+- Confidence thresholds are tuned against synthetic data; verify on real footage
+
+## Next phases
+
+| Phase | What it does | Status |
+|-------|-------------|--------|
+| 3 | Coordinate transforms, CSV/Parquet export | Not started |
+| 4 | Stats: radar views, Voronoi diagrams, pressing heatmaps | Not started |
+| 5 | FastAPI microservice for serving results | Not started |
+
+See `status.md` for live test counts and `CLAUDE.md` for project guidance.
