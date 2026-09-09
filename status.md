@@ -136,7 +136,10 @@ Resolved with a non-invasive seam rather than merging the two classes:
   belongs here, not in either existing class, since it's specifically
   about satisfying Phase 1b's contract), then calls
   `propagating_calibrator.process_frame()`. Single entrypoint:
-  `process_frame(frame) -> OrchestratedFrameResult`.
+  `process_frame(frame) -> OrchestratedFrameResult` (dataclass with
+  `scene_classification`, `calibration_info`, `keypoints_px`,
+  `keypoint_confidences`). Also exposes `pixel_to_world()`, delegating to
+  the wrapped `PropagatingCalibrator`.
 - 3 new tests, including a full broadcast -> close-up gap -> re-anchor
   sequence proving routing decisions and the state machine work correctly
   together end to end. 62/64 tests passing project-wide (the 2 "failures"
@@ -263,26 +266,216 @@ Resolved with a non-invasive seam rather than merging the two classes:
   re-supplying the complete updated `detection.py`. This is what motivated
   the "always re-show the full file on any edit" rule below, and the
   even stricter one-file-per-prompt rule.
-**Phase 2 is functionally complete.** Re-identification after long tracking
-gaps (`tracking/reid.py`) is implemented and integrated -- everything needed
-to produce a fully-populated `TrackedObject` (identity, class, team) for a
-normally-tracked frame exists and is tested.
+**Phase 2 is functionally complete.** The only item from the original plan
+not yet built is re-identification after long tracking gaps (see "Not
+started yet" below) -- everything needed to produce a fully-populated
+`TrackedObject` (identity, class, team) for a normally-tracked frame exists
+and is tested.
+ 
+### Phase 3 -- Coordinate transform layer + export
+- `coordinates/transform.py` -- `transform_tracked_objects(tracked_objects,
+  calibration, pitch_config, ...)`: pure function, batch pixel -> world
+  transform for a frame's `List[TrackedObject]`. **Deliberately imports
+  ONLY from `schemas/` and `config/`** -- no dependency on `calibration/`
+  or on any calibrator/orchestrator instance at all. This was a real design
+  simplification discovered while starting Phase 3, not the original plan:
+  `CalibrationInfo.homography` is already a serialized 3x3 list from the
+  calibration layer, so the transform doesn't need a `PitchCalibrator` or
+  `VideoCalibrationOrchestrator` object in hand -- it can project points
+  directly via `cv2.perspectiveTransform` on that raw matrix. This keeps
+  the "every stage after config/schemas talks only to those two packages"
+  rule from the project plan literally true for Phase 3, not just
+  aspirational.
+  - Never mutates input objects -- returns a new list via
+    `TrackedObject.model_copy(update=...)`, so a pre-transform pixel-space
+    list stays usable elsewhere (e.g. an overlay) without aliasing bugs.
+  - **Confidence policy** (design decisions confirmed with the user):
+    - `CALIBRATED_FROM_KEYPOINTS` -> `position_confidence = 1.0` (full
+      trust).
+    - `RE_ANCHORED` -> `position_confidence = 0.85` by default
+      (`re_anchored_confidence` param) -- discounted despite being a fresh
+      keypoint recompute, because the frame right after a propagated gap
+      is exactly where a re-identification identity link is most likely
+      to still be shaky.
+    - `PROPAGATED` -> decays with `frames_since_last_anchor`:
+      `max(propagated_confidence_floor, 1.0 -
+      propagated_decay_per_frame * frames)`, defaults `floor=0.3`,
+      `decay_per_frame=0.02`. Floored so a long-but-otherwise-healthy
+      propagation isn't driven all the way to zero by elapsed time alone.
+    - `NOT_CALIBRATED` (or a `CalibrationInfo` with no homography despite
+      a different status) -> `world_position = None`,
+      `position_confidence = None`, no projection attempted.
+  - **Out-of-bounds handling** (confirmed): a projected point failing
+    `PitchConfig.in_bounds()` is NOT dropped -- `world_position` is still
+    populated with the (implausible) value, but `position_confidence` is
+    forced to `0.0`. Keeps the point visible for debugging/overlay (e.g.
+    spotting a homography producing garbage) while telling downstream
+    stats not to trust it.
+  - `tests/test_transform.py` -- 9 tests: `NOT_CALIBRATED` passthrough,
+    exact pixel->world recovery + full confidence for
+    `CALIBRATED_FROM_KEYPOINTS` (synthetic 10px/meter homography, same
+    convention as `test_calibrator.py`), the `RE_ANCHORED` discount value,
+    `PROPAGATED` decay at two different gap lengths plus the floor clamp,
+    out-of-bounds keep-but-zero-confidence behavior, non-mutation of
+    inputs, identity-field (track_id/class) passthrough, and multi-object
+    batching. **Confirmed passing via the user's own local pytest run.**
+- `coordinates/export.py` -- `FrameResultCSVWriter` (context-manager
+  streaming writer) + `export_frames_to_csv()` (convenience wrapper over
+  an `Iterable[FrameResult]`, so a generator-based frame loop can be
+  passed directly without materializing the whole match into a list
+  first). Uses `FrameResult.to_flat_records()` (already built in Phase 0)
+  for the actual flattening -- this module's only job is dict-stream ->
+  CSV.
+  - **Streaming, not batch-in-memory, by design**: a full match can be
+    tens of thousands of frames. Writing incrementally with a flush after
+    every frame means (a) the whole match's tracked-object history is
+    never held in RAM at once, and (b) a crash partway through a long run
+    leaves a valid, readable partial CSV instead of losing everything --
+    the export-layer analogue of the project's existing "no silent
+    staleness" rule, applied to I/O instead of calibration state.
+  - **CSV only, no Parquet**, on purpose -- Parquet needs
+    `pyarrow`/`fastparquet`, a new dependency with no current downstream
+    consumer. CSV needs nothing beyond the stdlib `csv` module, consistent
+    with the project's minimal-dependency rule. Add a Parquet exporter
+    later, behind the same interface, if/when something actually needs it.
+  - Fixed, explicit `FIELDNAMES` list (not inferred from the first
+    frame's records) -- inferring is fragile if frame 0 happens to have
+    zero tracked objects.
+  - A frame with zero tracked objects contributes zero rows (no
+    placeholder row) -- the CSV is object-centric, not frame-centric.
+  - `tests/test_export.py` -- 11 tests: header correctness, row counts
+    (including the zero-row empty-frame case), value fidelity against
+    `to_flat_records()`, `None` -> empty-string CSV rendering, frame
+    ordering across multiple `write_frame()` calls, the
+    "must-be-used-as-context-manager" guard, the mid-run flush guarantee
+    (read the file while still inside the `with` block, before `__exit__`
+    runs), both the list and generator paths through
+    `export_frames_to_csv()`, and string-path support. Written this
+    session -- pending the user's own local pytest confirmation.
+**Phase 3 is functionally complete.** Per-track summary CSV remains
+deliberately deferred (trivially a `groupby("track_id")` over this
+module's CSV output via pandas, not worth bespoke code).
+ 
+### Phase 2 (remainder) -- Re-identification after long tracking gaps
+- `tracking/reid.py` -- `BaseReIdentifier` interface + `ReIdentifier`:
+  answers "is this frame's brand-new track actually a returning player
+  `ByteTracker` already dropped?" Sits in the pipeline between the team
+  classifier and Phase 3's transform:
+  `detector -> tracker -> team_classifier -> reid -> transform`. This
+  order is load-bearing, not incidental -- re-ID reads the team
+  classifier's per-track jersey-color cache
+  (`JerseyColorTeamClassifier.get_color_history()`, added additively to
+  support this) for both the incoming new track and whatever dropped
+  track it's compared against, so team classification must run first;
+  and its world-speed gate needs the current frame's homography, so
+  calibration must run before re-ID too.
+  - **`min_reid_gap_frames` structural coupling**: constructed as
+    `ReIdentifier(..., min_reid_gap_frames=tracker.max_age)` on purpose --
+    without this floor, a track missing for a single frame was
+    immediately re-ID-eligible and could lose to an older, unrelated
+    dropped track with a marginally closer color match, racing
+    `ByteTracker`'s own stage-2 low-confidence recovery pass that's
+    specifically built to survive that exact 1-frame case internally.
+    Tying the two constants together by construction (not as two
+    independently-tuned numbers) prevents this class of bug from
+    recurring.
+  - **Gating pipeline per candidate**: world-speed gate (rejects implied
+    speeds over `max_plausible_speed_mps`, default 12.0 -- generous on
+    purpose, since a false negative here is irrecoverable but a false
+    positive is not) -> color gate
+    (`color_match_max_distance_bgr`, default 60.0) -> optional pluggable
+    `appearance_embedder` tiebreaker (v1 default: none). Best surviving
+    candidate wins by lowest color distance, ties broken by recency.
+  - Re-stamps `track_id` and sets `provenance = RE_IDENTIFIED_AFTER_GAP`
+    on a match; otherwise the new track keeps its own ID untouched.
+  - Keeps its own per-track history (`_ReIdTrackHistory`, same
+    deliberately-non-pydantic private-bookkeeping pattern as
+    `ByteTracker._Track`) rather than relying solely on the team
+    classifier's cache, since it needs a world-position snapshot at drop
+    time and a color fallback the team classifier's cache doesn't
+    guarantee to have.
+  - Derives its own synthetic clock from `video_fps` (`0, 1/fps, 2/fps,
+    ...`) rather than accepting a frame index -- this only stays correct
+    if it's called exactly once per consecutive video frame, never
+    skipping. Documented as a real constraint on the caller, not papered
+    over.
+### Phase 2 + Phase 3 integration -- `MatchPipeline`
+The seam wiring tracking and coordinate-transform together into one
+real per-frame video-loop entrypoint, same shape as `orchestrator.py`
+being the seam between Phase 1a and 1b.
+- `video_pipeline.py` (project root, not inside any single package --
+  it's the one piece that legitimately needs to know about
+  `calibration/`, `tracking/`, `coordinates/`, `config/`, and `schemas/`
+  all at once) -- `MatchPipeline.process_frame(frame, frame_index,
+  timestamp_s) -> PipelineFrameOutput`. Fixed call order per frame:
+  1. `calibration_orchestrator.process_frame(frame)` -- runs FIRST,
+     since re-ID's speed gate needs this frame's homography and has no
+     way to ask for it later.
+  2. `detector.detect(frame) -> List[Detection]`
+  3. `tracker.update(detections) -> List[TrackedObject]`
+  4. `team_classifier.assign_teams(frame, tracked_objects)` -- populates
+     `.team` AND the per-track color cache re-ID reads next.
+  5. `reid.update(tracked_objects, calibration_info, video_fps)` --
+     re-stamps track_id/provenance where a returning player is
+     recognised.
+  6. `transform_tracked_objects(tracked_objects, calibration_info,
+     pitch_config, ...)` -- Phase 3, fills in `world_position` /
+     `position_confidence`.
+  7. Wraps the result in `FrameResult(frame_index, timestamp_s,
+     calibration_info, tracked_objects)` -- the canonical Phase 0 output.
+  - `frame_index`/`timestamp_s` are supplied by the CALLER on every call,
+    not tracked internally -- an internal counter would silently desync
+    from reality the moment a frame gets skipped upstream (e.g. a
+    frame-sampling step processing every 2nd frame), the same "no silent
+    staleness" principle used for calibration state and CSV export
+    elsewhere in this project. Tradeoff documented in the module
+    docstring: the caller-supplied `timestamp_s` must stay consistent
+    with the `video_fps` `reid` was constructed with, since `reid`
+    derives its own internal clock from `video_fps` rather than from
+    `frame_index` -- `MatchPipeline` cannot reconcile the two if they
+    drift, because `ReIdentifier.update()`'s interface doesn't accept a
+    frame index at all.
+  - `PipelineFrameOutput` wraps the canonical `FrameResult` alongside
+    calibration debug info (`scene_classification`, raw keypoints) that
+    overlay/debugging tools may want but that has no place in the
+    canonical schema -- same reasoning as `OrchestratedFrameResult`
+    keeping that data separate from `CalibrationInfo`.
+  - `reset()` resets `tracker` and `reid` only (via duck-typed
+    `getattr(..., "reset", None)`, same pattern as
+    `PropagatingCalibrator`'s calibrator-reset handling) -- for a hard
+    scene cut, where carrying tracker IDs or re-ID history across the
+    cut would be actively wrong. Deliberately does NOT reset
+    `calibration_orchestrator`: its internal state already self-corrects
+    the moment fresh keypoints reappear (`RE_ANCHORED`), which is the
+    right behavior across a cut too.
+  - `tests/test_video_pipeline.py` -- 12 tests, all against fakes/duck
+    types for every injected component except the real (unfaked)
+    `transform_tracked_objects` call: exact 5-component call order,
+    the calibration-info-reaches-reid handoff, video_fps forwarding, the
+    team-classification-visible-to-reid ordering guarantee, a re-ID
+    relink surviving into the final `FrameResult`, real-transform
+    world-position correctness (including a `NOT_CALIBRATED` case and a
+    `PROPAGATED` case with a custom decay override), caller-supplied
+    `frame_index`/`timestamp_s` passthrough, `PipelineFrameOutput`'s
+    debug fields, and `reset()` touching only `tracker`/`reid` -- not
+    the calibration orchestrator. One real test bug caught: the fake
+    detection in the test setup passed `bounding_box=None`, but unlike
+    `TrackedObject.bounding_box` (optional), `Detection.bounding_box` is
+    a required field -- fixed in the test, not production code.
+    **Confirmed passing via the user's own local pytest run: 155/155
+    tests project-wide.**
+**Phase 2 is now fully complete, including re-identification.** The
+Phase 1a/1b and Phase 2/3 integration seams both now exist, giving the
+project one real usable entrypoint end to end:
+`MatchPipeline.process_frame(frame, frame_index, timestamp_s)`.
  
 ## Not started yet
  
-- Phase 2 (remainder) -- re-identification after long tracking gaps
-  (position gating by max plausible speed, team/jersey-color first-pass
-  filter now buildable on top of `JerseyColorTeamClassifier`'s output,
-  appearance-embedding tiebreaker). Not blocking Phase 3 -- normal
-  continuous tracking already produces complete, team-labeled
-  `TrackedObject`s; re-identification only matters for the specific
-  "camera zoomed into a duel and lost everyone else" gap case described in
-  the project plan.
-- Phase 3 -- coordinate transform layer (batch pixel->world for tracked
-  objects, CSV/Parquet export).
 - Phase 4 -- stats/analysis layer (radar view, team shape, Voronoi,
   pressing heatmaps, offside line, pass detection) -- design-only so far,
-  see the plan doc.
+  see the plan doc. This is the next real design work, now that
+  `MatchPipeline` actually produces the `FrameResult`-shaped, fully
+  world-position-and-identity-enriched data it depends on.
 - Phase 5 -- API/microservice layer.
 ## Standing facts worth knowing
  
@@ -311,12 +504,30 @@ normally-tracked frame exists and is tested.
   sanity-checking (or retuning) against real broadcast footage lighting
   once available, particularly artificial-turf or unusually
   yellow/dry-grass pitches that might sit closer to the hue boundary.
+- The Phase 3 confidence-policy constants (`re_anchored_confidence=0.85`,
+  `propagated_confidence_floor=0.3`, `propagated_decay_per_frame=0.02`)
+  are inspection-chosen defaults, same caveat as every other
+  inspection-tuned threshold in this project (scene classifier, green-hue
+  mask) -- worth revisiting once real footage/tracking data exists to
+  check whether the decay rate and floor actually match observed drift
+  behavior, rather than treating them as final.
+- `ReIdentifier`'s tuning constants (`max_plausible_speed_mps=12.0`,
+  `color_match_max_distance_bgr=60.0`, `max_reid_gap_s=5.0`) are likewise
+  inspection-chosen, not validated against real footage yet.
+  `min_reid_gap_frames` is the one exception -- it's deliberately NOT an
+  independent inspection-tuned constant, it's structurally coupled to
+  `ByteTracker.max_age` by construction (`min_reid_gap_frames=
+  tracker.max_age`) specifically to prevent re-ID and the tracker's own
+  recovery window from fighting each other.
 - `requirements.txt` is current: `pydantic`, `numpy`, `opencv-python` (core,
-  needed for the whole test suite -- now also a hard, non-lazy import in
-  `tracking/team_classifier.py` for `cv2.kmeans`, same as it already was in
-  `calibration/`), `ultralytics` (only needed by `YoloKeypointModel`/
-  `YoloObjectDetector` for real inference, lazily imported so nothing else
-  requires it), `pytest` (dev/testing).
+  needed for the whole test suite -- non-lazy import in
+  `tracking/team_classifier.py` for `cv2.kmeans`, `coordinates/
+  transform.py` for `cv2.perspectiveTransform`, and `tracking/reid.py`
+  for the same, same as it already was in `calibration/`), `ultralytics`
+  (only needed by `YoloKeypointModel`/`YoloObjectDetector` for real
+  inference, lazily imported so nothing else requires it), `pytest`
+  (dev/testing). No new dependency was added for Phase 3 or the reid/
+  integration work -- CSV export uses only the stdlib `csv` module.
 ## Working style for this project (updated)
  
 - Build and verify one file/feature at a time rather than batching
@@ -350,9 +561,10 @@ normally-tracked frame exists and is tested.
     addition) can be handled by the user directly without spending a
     prompt on them, as happened with `tracking/__init__.py` this session.
 - Design decision points (e.g. jersey-color feature extraction, centroid
-  stability strategy, goalkeeper handling) are proposed as explicit,
-  numbered choices and confirmed by the user BEFORE any code is written --
-  reinforced again this session for the team classifier.
+  stability strategy, goalkeeper handling, and -- this session -- the
+  Phase 3 confidence-discount policy and out-of-bounds handling) are
+  proposed as explicit, numbered choices and confirmed by the user BEFORE
+  any code is written.
 - Sandbox resilience note: mid-project, the sandbox environment reset
   (lost all files, then lost package-registry access) -- full project was
   reconstructed from conversation history alone and verification continued
@@ -361,22 +573,37 @@ normally-tracked frame exists and is tested.
   pydantic validators, so `test_frame_result.py` and `test_pitch_config.py`
   show as failing in-sandbox -- both are known-good from the user's own
   local `pytest` runs and unaffected by anything built since. The user's
-  own local environment (Windows, real venv) has confirmed Phase 1, Phase
-  2's detection/detector/tracker pieces, and now the team classifier, pass
-  for real via `pytest`.
+  own local environment (Windows, real venv) has confirmed Phase 1, all
+  of Phase 2 (detection/detector/tracker, team classifier, re-ID), Phase
+  3 (transform + export), and the `MatchPipeline` integration layer all
+  pass for real via `pytest` -- 155/155 project-wide as of the
+  `MatchPipeline` session.
 - **Reminder for next session**: project knowledge base files (this status
-  doc, and any copies of `tracking/__init__.py` or other source files kept
-  there) can drift out of sync with the user's actual local repo -- this
-  was confirmed firsthand this session when the attached `tracking/
-  __init__.py` snapshot didn't match what the status doc claimed was
-  already exported. Treat the user's local checkout as the source of
-  truth whenever the two disagree, and ask/diff rather than overwrite
-  blind.
+  doc, and any copies of source files kept there) can drift out of sync
+  with the user's actual local repo -- confirmed firsthand earlier this
+  project when an attached `tracking/__init__.py` snapshot didn't match
+  what the status doc claimed was already exported, and again when this
+  session started with only the plan/status docs in the knowledge base and
+  no actual `.py` source files (including `calibration/orchestrator.py`,
+  needed for Phase 3 and only obtained by the user pasting it directly).
+  Treat the user's local checkout as the source of truth whenever the two
+  disagree, and ask/diff rather than overwrite blind. Consider adding
+  actual source files to the project knowledge base (not just these two
+  planning docs) if repeatedly re-pasting files each session becomes a
+  recurring cost.
 ## Next up
  
-Phase 3 -- coordinate transform layer: a pure `(pixel_position,
-homography_or_propagated) -> world_position` function applied per tracked
-object per frame, consuming `VideoCalibrationOrchestrator`'s output
-alongside `ByteTracker`'s (now team-labeled) `TrackedObject`s, plus
-CSV/Parquet export via `FrameResult.to_flat_records()` (already built in
-Phase 0 and just waiting for real data to flatten).
+Phase 4 -- stats/analysis layer design, starting with 4a (the top-down
+tactical "radar" view, per the plan doc's suggested build order -- cheap,
+needs only Phase 3 world positions, and doubles as a visual sanity check
+for everything upstream: a jittery or drifting radar view is an early
+warning sign for a calibration or tracking bug before any numeric stat
+would reveal it). `MatchPipeline` now produces real
+`FrameResult`-shaped, world-position-and-identity-enriched data end to
+end, so this is genuinely buildable now, not just designable.
+ 
+Also still open, not urgent: actually hooking `FrameResultCSVWriter` up
+to a real `MatchPipeline`-driven video loop (both are independently
+tested and the wiring is trivial -- `writer.write_frame(output.
+frame_result)` per iteration -- just hasn't been written as an
+end-to-end script/example yet).
