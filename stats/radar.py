@@ -31,7 +31,7 @@ Confidence -> opacity, with a floor:
 Not included in this first pass (nice-to-haves, not blockers for the radar
 being useful as a sanity check): penalty-arc curves at the edge of the
 penalty area, goal-mouth rectangles. Both are easy additions later behind
-the same `_draw_pitch_markings` seam if wanted.
+the same `draw_pitch_markings` seam if wanted.
 """
 
 from typing import Optional, Tuple
@@ -90,7 +90,7 @@ def world_to_pixel(
     return int(round(px)), int(round(py))
 
 
-def _draw_pitch_markings(
+def draw_pitch_markings(
     canvas: np.ndarray,
     pitch_config: PitchConfig,
     pixels_per_meter: float,
@@ -222,7 +222,7 @@ def render_radar_frame(
     width, height = get_canvas_size(pitch_config, pixels_per_meter, margin_m)
     canvas = np.full((height, width, 3), pitch_color, dtype=np.uint8)
 
-    _draw_pitch_markings(canvas, pitch_config, pixels_per_meter, margin_m,
+    draw_pitch_markings(canvas, pitch_config, pixels_per_meter, margin_m,
                           line_color, line_thickness)
 
     for obj in tracked_objects:
