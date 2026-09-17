@@ -15,7 +15,7 @@ and calibrator never import YOLO directly, only this interface.
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -45,7 +45,17 @@ class YoloKeypointModel(BaseKeypointModel):
     GPU to be present at all.
     """
 
-    def __init__(self, model_path: str, num_keypoints: int = 29):
+    def __init__(self, model_path: str, num_keypoints: int = 29, device: Optional[str] = None):
+        """
+        device: passed straight through to ultralytics on every inference
+            call (e.g. "cuda:0", "cpu", "mps"). None (default) leaves it to
+            ultralytics' own auto-detection -- which silently falls back to
+            CPU if the installed torch build has no CUDA support, even on a
+            machine with a real GPU physically present. Explicit is safer
+            than relying on auto-detection to notice a GPU is available:
+            pass "cuda:0" whenever you expect this to run on GPU, rather
+            than assuming it will be picked up automatically.
+        """
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -56,13 +66,14 @@ class YoloKeypointModel(BaseKeypointModel):
 
         self.model_path = model_path
         self.num_keypoints = num_keypoints
+        self.device = device
         try:
             self.model = YOLO(model_path)
         except Exception as e:
             raise RuntimeError(f"Failed to load YOLO model from {model_path}: {e}") from e
 
     def predict(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, device=self.device)
 
         keypoints = np.zeros((self.num_keypoints, 2), dtype=np.float32)
         confidences = np.zeros((self.num_keypoints,), dtype=np.float32)

@@ -14,7 +14,7 @@ be visible.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -56,7 +56,17 @@ class YoloObjectDetector(BaseObjectDetector):
         model_path: str,
         class_id_map: Dict[int, ObjectClass],
         confidence_threshold: float = 0.3,
-    ):
+        device: Optional[str] = None,
+     ):
+        """
+        device: passed straight through to ultralytics on every detect()
+            call (e.g. "cuda:0", "cpu", "mps"). None (default) leaves it to
+            ultralytics' own auto-detection -- which silently falls back to
+            CPU if the installed torch build has no CUDA support, even on a
+            machine with a real GPU physically present. Same reasoning and
+            same param shape as YoloKeypointModel.device -- explicit beats
+            relying on auto-detection to notice a GPU is available.
+        """
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -68,6 +78,7 @@ class YoloObjectDetector(BaseObjectDetector):
         self.model_path = model_path
         self.class_id_map = dict(class_id_map)
         self.confidence_threshold = confidence_threshold
+        self.device = device
         try:
             self.model = YOLO(model_path)
         except Exception as e:
@@ -118,7 +129,7 @@ class YoloObjectDetector(BaseObjectDetector):
         return detections
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, device=self.device)
 
         detections: List[Detection] = []
         for result in results:
