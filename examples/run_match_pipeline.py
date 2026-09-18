@@ -2,8 +2,10 @@
 End-to-end video-loop driver: reads a video file frame by frame, runs it
 through `MatchPipeline` (Phase 1-3, already fully wired), writes the
 resulting per-frame tracks to CSV via `FrameResultCSVWriter`, and
-optionally renders a radar-only video via `stats/radar.py` for visual
-sanity-checking.
+optionally renders any combination of a radar-only video, an annotated
+source-footage video, and a side-by-side combined video -- all via
+`stats/radar.py` and `stats/overlay.py`, never by drawing anything
+directly in this script (see the "owns wiring ONLY" note below).
 
 This is a driver script, not a library module -- same role as
 `examples/demo_schema_usage.py`, just exercising the real pipeline instead
@@ -24,7 +26,7 @@ do for the test suite), from the directory ONE LEVEL ABOVE the
         --detection-model weights/player_ball.pt \\
         --class-id-map 0:ball,1:goalkeeper,2:player,3:referee \\
         --output-csv tracks.csv \\
-        --output-radar-video radar.mp4
+        --output-combined-video combined.mp4
 
 Known gaps, left for later (not silently papered over here):
   - No scene-cut detection. `MatchPipeline.reset()` exists specifically
@@ -38,6 +40,13 @@ Known gaps, left for later (not silently papered over here):
   - The real `class_id_map` for your trained detection model hasn't been
     finalized -- `--class-id-map` is a required CLI arg specifically so
     nothing here guesses at it.
+
+An earlier draft of the annotated/combined video feature drew boxes and
+labels directly inline in this script. That was reverted before being
+applied -- it violated this script's own "owns wiring ONLY" rule above.
+The actual drawing/compositing logic now lives in `stats/overlay.py`,
+tested there; this script only decides which outputs were requested and
+calls into it.
 """
 
 import argparse
@@ -47,8 +56,6 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import cv2
-
-from ..calibration.keypoint_model import YoloKeypointModel
 
 from ..calibration.calibrator import PitchCalibrator
 from ..calibration.camera_motion_tracker import CameraMotionTracker
@@ -61,6 +68,8 @@ from ..config.pitch_config import PitchConfig
 from ..coordinates.export import FrameResultCSVWriter
 from ..schemas.enums import ObjectClass
 from ..stats.radar import get_canvas_size, render_radar_frame
+from ..stats.overlay import compose_side_by_side, compute_combined_size, draw_tracking_overlay
+from ..calibration.keypoint_model import YoloKeypointModel
 from ..tracking.detector import YoloObjectDetector
 from ..tracking.reid import ReIdentifier
 from ..tracking.team_classifier import JerseyColorTeamClassifier
@@ -136,7 +145,10 @@ def build_match_pipeline(args: argparse.Namespace, pitch_config: PitchConfig, vi
     model_paths = {SceneType.BROADCAST_WIDE: args.keypoint_model}
     if args.low_angle_keypoint_model:
         model_paths[SceneType.LOW_ANGLE_CORNER] = args.low_angle_keypoint_model
-    model_registry = KeypointModelRegistry(model_paths=model_paths, model_loader=lambda path: YoloKeypointModel(path, device=args.device))
+    model_registry = KeypointModelRegistry(
+        model_paths=model_paths,
+        model_loader=lambda path: YoloKeypointModel(path, device=args.device),
+    )
 
     calibration_pipeline = CalibrationPipeline(pitch_config, model_registry)
 
@@ -206,18 +218,41 @@ def run(args: argparse.Namespace) -> None:
     pitch_config = build_pitch_config(args)
     match_pipeline = build_match_pipeline(args, pitch_config, video_fps)
 
-    radar_writer: Optional[cv2.VideoWriter] = None
-    if args.output_radar_video:
-        canvas_size = get_canvas_size(pitch_config, args.radar_pixels_per_meter, args.radar_margin_m)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        radar_writer = cv2.VideoWriter(args.output_radar_video, fourcc, video_fps, canvas_size)
-        if not radar_writer.isOpened():
+    video_frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    radar_canvas_size = get_canvas_size(pitch_config, args.radar_pixels_per_meter, args.radar_margin_m)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    def _open_writer(path: str, size) -> cv2.VideoWriter:
+        writer = cv2.VideoWriter(path, fourcc, video_fps, size)
+        if not writer.isOpened():
             raise RuntimeError(
-                f"Could not open radar output video for writing: "
-                f"{args.output_radar_video} (codec availability varies by "
-                f"OpenCV build/platform -- try a different extension/codec "
-                f"if this fails)."
+                f"Could not open output video for writing: {path} (codec "
+                f"availability varies by OpenCV build/platform -- try a "
+                f"different extension/codec if this fails)."
             )
+        return writer
+
+    radar_writer: Optional[cv2.VideoWriter] = (
+        _open_writer(args.output_radar_video, radar_canvas_size) if args.output_radar_video else None
+    )
+    annotated_writer: Optional[cv2.VideoWriter] = (
+        _open_writer(args.output_annotated_video, video_frame_size) if args.output_annotated_video else None
+    )
+    combined_writer: Optional[cv2.VideoWriter] = (
+        _open_writer(args.output_combined_video, compute_combined_size(video_frame_size, radar_canvas_size))
+        if args.output_combined_video else None
+    )
+
+    # Render each view AT MOST ONCE per frame even if multiple outputs
+    # need it -- e.g. --output-radar-video and --output-combined-video
+    # together must not render the radar frame twice.
+    need_radar = radar_writer is not None or combined_writer is not None
+    need_annotated = annotated_writer is not None or combined_writer is not None
+    # Backward-compatible fallback: --display with no output path at all
+    # still renders a radar frame purely for the preview window, same as
+    # this script's original (pre-annotated/combined) --display behavior.
+    if args.display and not need_radar and not need_annotated:
+        need_radar = True
 
     frame_index = 0
     total_rows = 0
@@ -237,19 +272,39 @@ def run(args: argparse.Namespace) -> None:
                 output = match_pipeline.process_frame(frame, frame_index, timestamp_s)
                 total_rows += csv_writer.write_frame(output.frame_result)
 
-                if radar_writer is not None:
+                radar_frame = None
+                if need_radar:
                     radar_frame = render_radar_frame(
                         output.frame_result.tracked_objects, pitch_config,
                         pixels_per_meter=args.radar_pixels_per_meter,
                         margin_m=args.radar_margin_m,
                     )
-                    radar_writer.write(radar_frame)
+                    if radar_writer is not None:
+                        radar_writer.write(radar_frame)
 
-                    if args.display:
+                annotated_frame = None
+                if need_annotated:
+                    annotated_frame = draw_tracking_overlay(frame, output.frame_result.tracked_objects)
+                    if annotated_writer is not None:
+                        annotated_writer.write(annotated_frame)
+
+                if combined_writer is not None:
+                    combined_frame = compose_side_by_side(annotated_frame, radar_frame)
+                    combined_writer.write(combined_frame)
+
+                if args.display:
+                    # Priority when several outputs are active at once:
+                    # show the richest single view rather than opening
+                    # several preview windows at once.
+                    if combined_writer is not None:
+                        cv2.imshow("Combined", combined_frame)
+                    elif annotated_writer is not None:
+                        cv2.imshow("Annotated", annotated_frame)
+                    elif radar_frame is not None:
                         cv2.imshow("Radar", radar_frame)
-                        if cv2.waitKey(1) & 0xFF == ord("q"):
-                            print("Display window closed by user (q) -- stopping early.")
-                            break
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("Display window closed by user (q) -- stopping early.")
+                        break
 
                 if frame_index % args.log_every == 0:
                     elapsed = time.monotonic() - start_time
@@ -265,6 +320,10 @@ def run(args: argparse.Namespace) -> None:
         cap.release()
         if radar_writer is not None:
             radar_writer.release()
+        if annotated_writer is not None:
+            annotated_writer.release()
+        if combined_writer is not None:
+            combined_writer.release()
         if args.display:
             cv2.destroyAllWindows()
 
@@ -276,6 +335,10 @@ def run(args: argparse.Namespace) -> None:
     )
     if radar_writer is not None:
         print(f"Radar video written to {args.output_radar_video}.")
+    if annotated_writer is not None:
+        print(f"Annotated video written to {args.output_annotated_video}.")
+    if combined_writer is not None:
+        print(f"Combined video written to {args.output_combined_video}.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -296,9 +359,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-csv", default="tracks.csv", help="Output CSV path (default: tracks.csv).")
     parser.add_argument("--output-radar-video", default=None,
                         help="Optional output path for a radar-only .mp4. Omit to skip radar rendering entirely.")
+    parser.add_argument("--output-annotated-video", default=None,
+                        help="Optional output path for a .mp4 of the SOURCE footage with bounding boxes, "
+                             "track_id, and world coordinates drawn on top of each player.")
+    parser.add_argument("--output-combined-video", default=None,
+                        help="Optional output path for a .mp4 combining the annotated source footage and the "
+                             "radar view side by side (radar scaled to match the source footage's height, "
+                             "never the other way around). Independent of --output-annotated-video / "
+                             "--output-radar-video -- request this alone if you only want the combined file.")
     parser.add_argument("--display", action="store_true",
-                        help="Show a live radar preview window while processing (requires --output-radar-video "
-                             "or renders radar frames purely for display if omitted). Press 'q' to stop early.")
+                        help="Show a live preview window while processing. Shows the combined view if "
+                             "--output-combined-video is set, else the annotated view if --output-annotated-video "
+                             "is set, else the radar view (rendered for preview even with no output path). "
+                             "Press 'q' to stop early.")
 
     parser.add_argument("--pitch-length", type=float, default=None, help="Override pitch length in meters.")
     parser.add_argument("--pitch-width", type=float, default=None, help="Override pitch width in meters.")
@@ -328,11 +401,11 @@ def main() -> None:
     # that render is only worth the cost if the caller actually asked to
     # see something, so we validate the combination rather than silently
     # rendering nothing.
-    if args.display and not args.output_radar_video:
+    if args.display and not (args.output_radar_video or args.output_annotated_video or args.output_combined_video):
         print(
-            "Note: --display was set without --output-radar-video -- "
-            "a radar frame will still be rendered every frame for the "
-            "preview window, but nothing will be saved to disk.",
+            "Note: --display was set with no output path -- a radar frame "
+            "will still be rendered every frame for the preview window, "
+            "but nothing will be saved to disk.",
             file=sys.stderr,
         )
 
