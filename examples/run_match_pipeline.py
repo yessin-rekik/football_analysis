@@ -64,6 +64,7 @@ from ..calibration.orchestrator import VideoCalibrationOrchestrator
 from ..calibration.pipeline import CalibrationPipeline
 from ..calibration.propagating_calibrator import PropagatingCalibrator
 from ..calibration.scene_types import SceneType
+from ..calibration.scene_classifier import HeuristicSceneClassifier
 from ..config.pitch_config import PitchConfig
 from ..coordinates.export import FrameResultCSVWriter
 from ..schemas.enums import ObjectClass
@@ -150,14 +151,34 @@ def build_match_pipeline(args: argparse.Namespace, pitch_config: PitchConfig, vi
         model_loader=lambda path: YoloKeypointModel(path, device=args.device),
     )
 
-    calibration_pipeline = CalibrationPipeline(pitch_config, model_registry)
+    # Explicit scene classifier with tunable thresholds -- these were
+    # inspection-tuned defaults (min_points_for_calibration=4,
+    # min_coverage_fraction=0.15), never validated against real footage.
+    # Exposed here so a bad classification on real footage can be
+    # diagnosed and corrected without editing library code.
+    scene_classifier = HeuristicSceneClassifier(
+        min_points_for_calibration=args.scene_min_points,
+        min_width_fraction=args.scene_min_width_fraction,
+        min_height_fraction=args.scene_min_height_fraction,
+        min_broadcast_fallback_fraction=args.scene_min_broadcast_fallback_fraction,
+    )
+    calibration_pipeline = CalibrationPipeline(
+        pitch_config, model_registry, scene_classifier=scene_classifier,
+        confidence_threshold=args.calibration_confidence_threshold,
+    )
 
     # Explicit PitchCalibrator INSTANCE, not the PitchConfig itself --
     # PropagatingCalibrator needs something with a .calibrate_frame()
     # method. Passing PitchConfig here directly was a real bug caught
     # previously in this project; this is the fix, applied at
     # construction time so it can't recur.
-    base_calibrator = PitchCalibrator(pitch_config)
+    
+    # Same confidence_threshold as the scene classifier above -- the
+    # classifier's "is this keypoint visible" decision and the actual
+    # homography math's point selection must agree on what counts as
+    # visible.
+    base_calibrator = PitchCalibrator(pitch_config, confidence_threshold=args.calibration_confidence_threshold)
+
     camera_motion_tracker = CameraMotionTracker()
     propagating_calibrator = PropagatingCalibrator(
         base_calibrator, camera_motion_tracker, max_propagated_frames=args.max_propagated_frames,
@@ -308,9 +329,14 @@ def run(args: argparse.Namespace) -> None:
 
                 if frame_index % args.log_every == 0:
                     elapsed = time.monotonic() - start_time
+                    scene = output.scene_classification
+                    calibration = output.frame_result.calibration
                     print(
-                        f"frame {frame_index} | scene={output.scene_classification.scene_type.value} "
-                        f"| calibration={output.frame_result.calibration.status.value} "
+                        f"frame {frame_index} | scene={scene.scene_type.value} "
+                        f"(confidence={scene.confidence:.2f}, {scene.details}) "
+                        f"| calibration={calibration.status.value} "
+                        f"(frames_since_anchor={calibration.frames_since_last_anchor}, "
+                        f"num_keypoints_used={calibration.num_keypoints_used}) "
                         f"| tracked_objects={len(output.frame_result.tracked_objects)} "
                         f"| rows_so_far={total_rows} | elapsed={elapsed:.1f}s"
                     )
@@ -379,6 +405,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-propagated-frames", type=int, default=None,
                         help="Cap on consecutive PROPAGATED frames before falling back to NOT_CALIBRATED. "
                              "Default: no cap.")
+
+    parser.add_argument("--calibration-confidence-threshold", type=float, default=0.5,
+                        help="Minimum keypoint confidence to count as 'visible' -- shared by both the scene "
+                             "classifier's routing decision and the homography fit itself. Lower this if "
+                             "diagnostic logging shows keypoints detected but just below this bar.")
+    parser.add_argument("--scene-min-points", type=int, default=4,
+                        help="Minimum confidently-visible pitch keypoints before a frame is even considered "
+                             "for calibration -- below this, CLOSE_UP regardless of anything else. A "
+                             "homography mathematically needs >= 4 correspondences, so check the diagnostic "
+                             "log's 'num_visible' field before lowering this.")
+
+    parser.add_argument("--scene-min-width-fraction", type=float, default=0.2,
+                        help="Minimum fraction of the frame's WIDTH the visible keypoints must span, on "
+                             "EITHER axis (see --scene-min-height-fraction), to avoid being rejected as "
+                             "CLOSE_UP. Check the diagnostic log's 'width_fraction'/'height_fraction' "
+                             "fields before tuning this.")
+    parser.add_argument("--scene-min-height-fraction", type=float, default=0.2,
+                        help="Same as --scene-min-width-fraction, for the HEIGHT axis. A frame is only "
+                             "rejected as CLOSE_UP if BOTH axes fall below their thresholds.")
+    parser.add_argument("--scene-min-broadcast-fallback-fraction", type=float, default=0.3,
+                        help="Separate, higher single-axis threshold for the boundary-only BROADCAST_WIDE "
+                             "fallback rule (no center-pitch features, but wide boundary spread).")
+    
     parser.add_argument("--detection-confidence-threshold", type=float, default=0.3)
     parser.add_argument("--tracker-max-age", type=int, default=30)
     parser.add_argument("--tracker-min-hits", type=int, default=3)
