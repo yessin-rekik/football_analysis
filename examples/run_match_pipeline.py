@@ -69,7 +69,7 @@ from ..config.pitch_config import PitchConfig
 from ..coordinates.export import FrameResultCSVWriter
 from ..schemas.enums import ObjectClass
 from ..stats.radar import get_canvas_size, render_radar_frame
-from ..stats.overlay import compose_side_by_side, compute_combined_size, draw_tracking_overlay
+from ..stats.overlay import compose_side_by_side, compute_combined_size, draw_keypoint_overlay, draw_tracking_overlay
 from ..calibration.keypoint_model import YoloKeypointModel
 from ..tracking.detector import YoloObjectDetector
 from ..tracking.reid import ReIdentifier
@@ -305,7 +305,14 @@ def run(args: argparse.Namespace) -> None:
 
                 annotated_frame = None
                 if need_annotated:
-                    annotated_frame = draw_tracking_overlay(frame, output.frame_result.tracked_objects)
+                    frame_for_annotation = frame
+                    if args.show_keypoints:
+                        frame_for_annotation = draw_keypoint_overlay(
+                            frame_for_annotation, output.keypoints_px, output.keypoint_confidences,
+                            confidence_threshold=args.calibration_confidence_threshold,
+                            min_display_confidence=args.keypoint_display_min_confidence,
+                        )
+                    annotated_frame = draw_tracking_overlay(frame_for_annotation, output.frame_result.tracked_objects)
                     if annotated_writer is not None:
                         annotated_writer.write(annotated_frame)
 
@@ -393,6 +400,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "radar view side by side (radar scaled to match the source footage's height, "
                              "never the other way around). Independent of --output-annotated-video / "
                              "--output-radar-video -- request this alone if you only want the combined file.")
+
+    parser.add_argument("--show-keypoints", action="store_true",
+                        help="Overlay the raw per-slot pitch keypoint detections (green = counted as "
+                             "'visible', red = detected but below --calibration-confidence-threshold) "
+                             "onto the annotated and combined video outputs. Off by default.")
+    parser.add_argument("--keypoint-display-min-confidence", type=float, default=0.05,
+                        help="Keypoints below this confidence aren't drawn at all, even with "
+                             "--show-keypoints -- avoids cluttering the frame with placeholder-only slots.")
+    
     parser.add_argument("--display", action="store_true",
                         help="Show a live preview window while processing. Shows the combined view if "
                              "--output-combined-video is set, else the annotated view if --output-annotated-video "

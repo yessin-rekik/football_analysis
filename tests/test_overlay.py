@@ -1,10 +1,17 @@
 import numpy as np
 import pytest
 
+from ..config.pitch_config import PitchKeypointName
 from ..schemas.enums import ObjectClass, Team
 from ..schemas.frame_result import BoundingBox, PixelPoint, TrackedObject, WorldPoint
-from ..stats.overlay import compose_side_by_side, compute_combined_size, draw_tracking_overlay
+from ..stats.overlay import (
+    compose_side_by_side,
+    compute_combined_size,
+    draw_keypoint_overlay,
+    draw_tracking_overlay,
+)
 from ..stats.radar import DEFAULT_AWAY_COLOR, DEFAULT_BALL_COLOR, DEFAULT_HOME_COLOR, DEFAULT_NEUTRAL_COLOR
+from ..stats.overlay import DEFAULT_KEYPOINT_LOW_CONFIDENCE_COLOR, DEFAULT_KEYPOINT_VISIBLE_COLOR
 
 
 def _obj(
@@ -122,6 +129,103 @@ def test_empty_object_list_returns_unchanged_copy():
     annotated = draw_tracking_overlay(frame, [])
     assert np.array_equal(annotated, frame)
     assert annotated is not frame  # still a copy, not the same array
+
+
+# ---- draw_keypoint_overlay ----
+
+def _blank_keypoints(num_total=29):
+    kps = np.zeros((num_total, 2), dtype=np.float32)
+    confs = np.zeros((num_total,), dtype=np.float32)
+    return kps, confs
+
+
+def test_keypoint_overlay_does_not_mutate_input_frame():
+    frame = _blank_frame()
+    original = frame.copy()
+    kps, confs = _blank_keypoints()
+    kps[15] = (150, 100)
+    confs[15] = 0.9
+    draw_keypoint_overlay(frame, kps, confs)
+    assert np.array_equal(frame, original)
+
+
+def test_none_keypoints_returns_unchanged_copy():
+    frame = _blank_frame()
+    annotated = draw_keypoint_overlay(frame, None, None)
+    assert np.array_equal(annotated, frame)
+    assert annotated is not frame
+
+
+def test_visible_keypoint_uses_visible_color_and_is_labeled():
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[PitchKeypointName.FIELD_CENTER] = (150, 100)
+    confs[PitchKeypointName.FIELD_CENTER] = 0.9
+    annotated = draw_keypoint_overlay(frame, kps, confs, confidence_threshold=0.5)
+    assert tuple(annotated[100, 150]) == DEFAULT_KEYPOINT_VISIBLE_COLOR
+    label_region = annotated[85:100, 155:280]
+    assert np.any(label_region != 0)  # the keypoint's name got drawn somewhere in this band
+
+
+def test_below_threshold_keypoint_uses_low_confidence_color_and_no_label():
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[0] = (100, 100)
+    confs[0] = 0.3  # detected, but below the 0.5 default threshold
+    annotated = draw_keypoint_overlay(frame, kps, confs, confidence_threshold=0.5)
+    assert tuple(annotated[100, 100]) == DEFAULT_KEYPOINT_LOW_CONFIDENCE_COLOR
+    label_region = annotated[80:95, 105:250]
+    assert not np.any(label_region != 0)  # no label drawn for a below-threshold keypoint
+
+
+def test_true_non_detection_below_display_floor_is_not_drawn_at_all():
+    """A slot the model never meaningfully detected (near-zero confidence,
+    placeholder coordinate) must not be drawn -- distinct from a
+    below-threshold-but-genuinely-detected keypoint, which IS drawn (just
+    in the low-confidence color)."""
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[9] = (50, 50)
+    confs[9] = 0.01  # below the default min_display_confidence of 0.05
+    annotated = draw_keypoint_overlay(frame, kps, confs)
+    assert tuple(annotated[50, 50]) == (0, 0, 0)
+
+
+def test_min_display_confidence_floor_is_tunable():
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[0] = (100, 100)
+    confs[0] = 0.3
+    # Raising the floor above this keypoint's own confidence must exclude
+    # it entirely, even though it would show as "below threshold" (red) at
+    # the default floor.
+    annotated = draw_keypoint_overlay(frame, kps, confs, confidence_threshold=0.5, min_display_confidence=0.5)
+    assert tuple(annotated[100, 100]) == (0, 0, 0)
+
+
+def test_multiple_keypoints_at_different_tiers_all_drawn_independently():
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[PitchKeypointName.FIELD_CENTER] = (150, 100)
+    confs[PitchKeypointName.FIELD_CENTER] = 0.9  # visible
+    kps[0] = (20, 20)
+    confs[0] = 0.3  # below threshold
+    annotated = draw_keypoint_overlay(frame, kps, confs, confidence_threshold=0.5)
+    assert tuple(annotated[100, 150]) == DEFAULT_KEYPOINT_VISIBLE_COLOR
+    assert tuple(annotated[20, 20]) == DEFAULT_KEYPOINT_LOW_CONFIDENCE_COLOR
+
+
+def test_show_labels_false_suppresses_all_labels():
+    frame = _blank_frame()
+    kps, confs = _blank_keypoints()
+    kps[PitchKeypointName.FIELD_CENTER] = (150, 100)
+    confs[PitchKeypointName.FIELD_CENTER] = 0.9
+    annotated = draw_keypoint_overlay(frame, kps, confs, confidence_threshold=0.5, show_labels=False)
+    # The dot itself still renders...
+    assert tuple(annotated[100, 150]) == DEFAULT_KEYPOINT_VISIBLE_COLOR
+    # ...but no label text anywhere in the region it would have occupied.
+    label_region = annotated[85:100, 155:280]
+    assert not np.any(label_region != 0)
 
 
 # ---- compute_combined_size ----
